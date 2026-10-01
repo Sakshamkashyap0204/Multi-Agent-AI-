@@ -26,8 +26,11 @@ DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: initialize database and seed initial data
-    await init_db()
-    await seed_database(db)
+    try:
+        await init_db()
+        await seed_database(db)
+    except Exception as e:
+        print("[WARN] Startup database initialization note:", e)
     yield
     # Shutdown
 
@@ -131,5 +134,6 @@ else:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
 
