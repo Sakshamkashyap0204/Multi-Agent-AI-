@@ -1,17 +1,14 @@
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from models.db_models import User, UserRole
-import os
+import bcrypt
+from models.database import MongoModel
 
-SECRET_KEY = os.getenv("SECRET_KEY", "orchestrate-ai-secret-key")
+SECRET_KEY = os.getenv("SECRET_KEY", "orchestrate-ai-secret-key-change-in-production")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 
-import bcrypt
 
 def verify_password(plain: str, hashed: str) -> bool:
     try:
@@ -43,20 +40,21 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-async def authenticate_user(db: AsyncSession, username: str, password: str) -> Optional[User]:
-    result = await db.execute(select(User).where(User.username == username))
-    user = result.scalar_one_or_none()
-    if user and verify_password(password, user.hashed_password):
-        return user
+async def authenticate_user(db, username: str, password: str) -> Optional[MongoModel]:
+    user_doc = await db.users.find_one({"username": username})
+    if user_doc and verify_password(password, user_doc.get("hashed_password", "")):
+        return MongoModel(user_doc)
     return None
 
 
-async def get_current_user(db: AsyncSession, token: str) -> Optional[User]:
+async def get_current_user(db, token: str) -> Optional[MongoModel]:
     payload = decode_token(token)
     if not payload:
         return None
     user_id = payload.get("sub")
     if not user_id:
         return None
-    result = await db.execute(select(User).where(User.id == user_id))
-    return result.scalar_one_or_none()
+    user_doc = await db.users.find_one({"_id": user_id})
+    if user_doc:
+        return MongoModel(user_doc)
+    return None

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from models.database import init_db, AsyncSessionLocal
+from models.database import init_db, db
 from services.seed import seed_database
 from services.websocket_manager import manager
 from api.auth import router as auth_router
@@ -27,8 +27,7 @@ DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 async def lifespan(app: FastAPI):
     # Startup: initialize database and seed initial data
     await init_db()
-    async with AsyncSessionLocal() as session:
-        await seed_database(session)
+    await seed_database(db)
     yield
     # Shutdown
 

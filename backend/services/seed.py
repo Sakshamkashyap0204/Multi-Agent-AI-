@@ -1,17 +1,6 @@
 from datetime import datetime, timedelta
-from models.db_models import (
-    User, Agent, Task, Subtask, AgentExecution, Approval, GovernancePolicy,
-    GovernanceEvent, AuditLog, TaskVersion, Notification,
-    UserRole, AgentStatus, TaskStatus, TaskPriority, ExecutionStatus,
-    ApprovalStatus, PolicyAction, PolicySeverity
-)
+from models.database import gen_id, MongoModel
 from services.auth import hash_password
-import uuid
-
-
-def gen_id():
-    return str(uuid.uuid4())
-
 
 AGENT_CONFIGS = [
     {
@@ -95,166 +84,188 @@ GOVERNANCE_POLICIES = [
         "name": "External Communication Policy",
         "description": "Require approval before any external communication or publication.",
         "category": "Communication",
-        "severity": PolicySeverity.high,
+        "severity": "high",
         "trigger": "Agent attempts external communication or publication",
-        "action": PolicyAction.require_approval,
+        "action": "require_approval",
     },
     {
         "name": "Financial Actions Policy",
         "description": "Require approval for financial recommendations exceeding $1M threshold.",
         "category": "Finance",
-        "severity": PolicySeverity.high,
+        "severity": "high",
         "trigger": "Financial recommendations exceed $1M threshold",
-        "action": PolicyAction.require_approval,
+        "action": "require_approval",
         "config": {"threshold": 1000000},
     },
     {
         "name": "Sensitive Data Policy",
         "description": "Block agents from processing restricted data without explicit permission.",
         "category": "Data",
-        "severity": PolicySeverity.critical,
+        "severity": "critical",
         "trigger": "Agent accesses sensitive or restricted data",
-        "action": PolicyAction.block,
+        "action": "block",
     },
     {
         "name": "Data Export Policy",
         "description": "Require approval before exporting enterprise data externally.",
         "category": "Data",
-        "severity": PolicySeverity.high,
+        "severity": "high",
         "trigger": "Agent attempts to export data outside the platform",
-        "action": PolicyAction.require_approval,
+        "action": "require_approval",
     },
     {
         "name": "Maximum Execution Steps",
         "description": "Automatically stop agents that exceed maximum iteration limit.",
         "category": "Safety",
-        "severity": PolicySeverity.medium,
+        "severity": "medium",
         "trigger": "Agent exceeds 10 execution iterations",
-        "action": PolicyAction.block,
+        "action": "block",
         "config": {"max_iterations": 10},
     },
     {
         "name": "Compliance Review Gate",
         "description": "Require compliance review before final synthesis on all tasks.",
         "category": "Compliance",
-        "severity": PolicySeverity.medium,
+        "severity": "medium",
         "trigger": "Task reaches final synthesis stage",
-        "action": PolicyAction.require_approval,
+        "action": "require_approval",
     },
     {
         "name": "Tool Access Control",
         "description": "Agents can only use explicitly permitted tools.",
         "category": "Security",
-        "severity": PolicySeverity.high,
+        "severity": "high",
         "trigger": "Agent requests access to unauthorized tool",
-        "action": PolicyAction.block,
+        "action": "block",
     },
     {
         "name": "Runtime Limit Policy",
         "description": "Automatically stop tasks running longer than 2 hours.",
         "category": "Safety",
-        "severity": PolicySeverity.medium,
+        "severity": "medium",
         "trigger": "Task runtime exceeds 2 hours",
-        "action": PolicyAction.warn,
+        "action": "warn",
         "config": {"max_runtime_minutes": 120},
     },
 ]
 
 
 async def seed_database(db):
-    from sqlalchemy import select
-
-    existing = await db.execute(select(User).limit(1))
-    if existing.scalar_one_or_none():
+    user_count = await db.users.count_documents({})
+    if user_count > 0:
         return
 
-    admin = User(
-        id=gen_id(),
-        email="admin@orchestrate.ai",
-        username="admin",
-        full_name="Alex Chen",
-        hashed_password=hash_password("admin123"),
-        role=UserRole.admin,
-    )
-    manager = User(
-        id=gen_id(),
-        email="manager@orchestrate.ai",
-        username="manager",
-        full_name="Sarah Mitchell",
-        hashed_password=hash_password("manager123"),
-        role=UserRole.manager,
-    )
-    operator = User(
-        id=gen_id(),
-        email="operator@orchestrate.ai",
-        username="operator",
-        full_name="James Park",
-        hashed_password=hash_password("operator123"),
-        role=UserRole.operator,
-    )
-    db.add_all([admin, manager, operator])
-    await db.flush()
+    admin = {
+        "_id": gen_id(),
+        "email": "admin@orchestrate.ai",
+        "username": "admin",
+        "full_name": "Alex Chen",
+        "hashed_password": hash_password("admin123"),
+        "role": "admin",
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    manager = {
+        "_id": gen_id(),
+        "email": "manager@orchestrate.ai",
+        "username": "manager",
+        "full_name": "Sarah Mitchell",
+        "hashed_password": hash_password("manager123"),
+        "role": "manager",
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    operator = {
+        "_id": gen_id(),
+        "email": "operator@orchestrate.ai",
+        "username": "operator",
+        "full_name": "James Park",
+        "hashed_password": hash_password("operator123"),
+        "role": "operator",
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    await db.users.insert_many([admin, manager, operator])
 
-    agents = {}
+    # Insert Agents
+    agents_docs = []
     for cfg in AGENT_CONFIGS:
-        agent = Agent(
-            id=gen_id(),
-            name=cfg["name"],
-            slug=cfg["slug"],
-            description=cfg["description"],
-            role=cfg["role"],
-            status=AgentStatus.active,
-            model="gpt-4o-mini",
-            system_prompt=cfg.get("system_prompt", ""),
-            capabilities=cfg.get("capabilities", []),
-            allowed_tools=cfg.get("allowed_tools", []),
-            permissions={},
-            max_iterations=10,
-            requires_approval=cfg.get("requires_approval", False),
-            tasks_completed=0,
-            tasks_failed=0,
-            total_execution_time=0.0,
-        )
-        db.add(agent)
-        agents[cfg["slug"]] = agent
-    await db.flush()
+        agent_doc = {
+            "_id": gen_id(),
+            "name": cfg["name"],
+            "slug": cfg["slug"],
+            "description": cfg["description"],
+            "role": cfg["role"],
+            "status": "active",
+            "model": "gpt-4o-mini",
+            "system_prompt": cfg.get("system_prompt", ""),
+            "capabilities": cfg.get("capabilities", []),
+            "allowed_tools": cfg.get("allowed_tools", []),
+            "permissions": {},
+            "max_iterations": 10,
+            "requires_approval": cfg.get("requires_approval", False),
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+            "total_execution_time": 0.0,
+            "created_at": datetime.utcnow(),
+        }
+        agents_docs.append(agent_doc)
+    await db.agents.insert_many(agents_docs)
 
-    policies = {}
+    # Insert Policies
+    policies_docs = []
+    policy_map = {}
     for pcfg in GOVERNANCE_POLICIES:
-        policy = GovernancePolicy(
-            id=gen_id(),
-            name=pcfg["name"],
-            description=pcfg["description"],
-            category=pcfg["category"],
-            severity=pcfg["severity"],
-            trigger=pcfg["trigger"],
-            action=pcfg["action"],
-            config=pcfg.get("config", {}),
-            is_active=True,
-        )
-        db.add(policy)
-        policies[pcfg["name"]] = policy
-    await db.flush()
+        p_doc = {
+            "_id": gen_id(),
+            "name": pcfg["name"],
+            "description": pcfg["description"],
+            "category": pcfg["category"],
+            "severity": pcfg["severity"],
+            "trigger": pcfg["trigger"],
+            "action": pcfg["action"],
+            "config": pcfg.get("config", {}),
+            "is_active": True,
+            "created_at": datetime.utcnow(),
+        }
+        policies_docs.append(p_doc)
+        policy_map[pcfg["name"]] = p_doc
+    await db.governance_policies.insert_many(policies_docs)
 
     now = datetime.utcnow()
 
-    vendor_task = Task(
-        id=gen_id(),
-        name="Vendor Risk Assessment",
-        description="Evaluate third-party vendor security posture and compliance status for annual review.",
-        goal="Produce a comprehensive vendor risk report with risk scores and remediation recommendations.",
-        priority=TaskPriority.high,
-        status=TaskStatus.completed,
-        governance_mode="strict",
-        human_oversight="approval_for_sensitive",
-        owner_id=manager.id,
-        current_step="Completed",
-        version=1,
-        started_at=now - timedelta(hours=3),
-        completed_at=now - timedelta(hours=1),
-        created_at=now - timedelta(hours=4),
-        updated_at=now - timedelta(hours=1),
-        final_output={
+    # Seed Demo Tasks
+    vendor_task_id = gen_id()
+    vendor_subtasks = [
+        {"id": gen_id(), "name": "Create Execution Plan", "agent_slug": "planner", "status": "completed", "order": 0, "depends_on": []},
+        {"id": gen_id(), "name": "Vendor Research", "agent_slug": "research", "status": "completed", "order": 1, "depends_on": []},
+        {"id": gen_id(), "name": "Risk Analysis", "agent_slug": "data_analyst", "status": "completed", "order": 2, "depends_on": []},
+        {"id": gen_id(), "name": "Compliance Check", "agent_slug": "compliance", "status": "completed", "order": 3, "depends_on": []},
+        {"id": gen_id(), "name": "Report Writing", "agent_slug": "writer", "status": "completed", "order": 4, "depends_on": []},
+        {"id": gen_id(), "name": "Review All Outputs", "agent_slug": "reviewer", "status": "completed", "order": 5, "depends_on": []},
+        {"id": gen_id(), "name": "Final Synthesis", "agent_slug": "synthesis", "status": "completed", "order": 6, "depends_on": []},
+    ]
+
+    vendor_task = {
+        "_id": vendor_task_id,
+        "name": "Vendor Risk Assessment",
+        "description": "Evaluate third-party vendor security posture and compliance status for annual review.",
+        "goal": "Produce a comprehensive vendor risk report with risk scores and remediation recommendations.",
+        "priority": "high",
+        "status": "COMPLETED",
+        "governance_mode": "strict",
+        "human_oversight": "approval_for_sensitive",
+        "owner_id": manager["_id"],
+        "owner_name": manager["full_name"],
+        "current_step": "Completed",
+        "current_agent": None,
+        "version": 1,
+        "subtasks": vendor_subtasks,
+        "started_at": now - timedelta(hours=3),
+        "completed_at": now - timedelta(hours=1),
+        "created_at": now - timedelta(hours=4),
+        "updated_at": now - timedelta(hours=1),
+        "final_output": {
             "status": "completed",
             "executive_summary": "Vendor risk assessment completed. 3 of 12 vendors flagged for remediation.",
             "key_findings": [
@@ -273,169 +284,167 @@ async def seed_database(db):
             "contributing_agents": ["planner", "research", "compliance", "writer", "reviewer", "synthesis"],
             "human_reviewed": True,
         }
-    )
+    }
 
-    feedback_task = Task(
-        id=gen_id(),
-        name="Customer Feedback Analysis",
-        description="Analyze Q3 customer feedback across all channels to identify satisfaction trends.",
-        goal="Identify top issues, satisfaction drivers, and actionable improvements.",
-        priority=TaskPriority.medium,
-        status=TaskStatus.waiting_for_approval,
-        governance_mode="standard",
-        human_oversight="approval_for_sensitive",
-        owner_id=operator.id,
-        current_step="Awaiting Human Approval",
-        current_agent="compliance",
-        version=1,
-        started_at=now - timedelta(minutes=45),
-        created_at=now - timedelta(hours=1),
-        updated_at=now - timedelta(minutes=5),
-    )
-
-    financial_task = Task(
-        id=gen_id(),
-        name="Quarterly Financial Review",
-        description="Prepare Q3 financial performance review with variance analysis and Q4 forecast.",
-        goal="Deliver executive financial summary with key metrics and forward-looking guidance.",
-        priority=TaskPriority.critical,
-        status=TaskStatus.paused,
-        governance_mode="strict",
-        human_oversight="approval_at_every_stage",
-        owner_id=manager.id,
-        current_step="Paused",
-        version=1,
-        started_at=now - timedelta(hours=2),
-        created_at=now - timedelta(hours=2, minutes=30),
-        updated_at=now - timedelta(minutes=30),
-    )
-
-    db.add_all([vendor_task, feedback_task, financial_task])
-    await db.flush()
-
-    vendor_subtasks = [
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Create Execution Plan", agent_slug="planner", status=ExecutionStatus.completed, order=0),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Vendor Research", agent_slug="research", status=ExecutionStatus.completed, order=1),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Risk Analysis", agent_slug="data_analyst", status=ExecutionStatus.completed, order=2),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Compliance Check", agent_slug="compliance", status=ExecutionStatus.completed, order=3),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Report Writing", agent_slug="writer", status=ExecutionStatus.completed, order=4),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Review All Outputs", agent_slug="reviewer", status=ExecutionStatus.completed, order=5),
-        Subtask(id=gen_id(), task_id=vendor_task.id, name="Final Synthesis", agent_slug="synthesis", status=ExecutionStatus.completed, order=6),
-    ]
-
+    feedback_task_id = gen_id()
     feedback_subtasks = [
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Create Execution Plan", agent_slug="planner", status=ExecutionStatus.completed, order=0),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Feedback Research", agent_slug="research", status=ExecutionStatus.completed, order=1),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Sentiment Analysis", agent_slug="data_analyst", status=ExecutionStatus.completed, order=2),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Report Writing", agent_slug="writer", status=ExecutionStatus.completed, order=3),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Review All Outputs", agent_slug="reviewer", status=ExecutionStatus.completed, order=4),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Compliance Check", agent_slug="compliance", status=ExecutionStatus.running, order=5),
-        Subtask(id=gen_id(), task_id=feedback_task.id, name="Final Synthesis", agent_slug="synthesis", status=ExecutionStatus.pending, order=6),
+        {"id": gen_id(), "name": "Create Execution Plan", "agent_slug": "planner", "status": "completed", "order": 0, "depends_on": []},
+        {"id": gen_id(), "name": "Feedback Research", "agent_slug": "research", "status": "completed", "order": 1, "depends_on": []},
+        {"id": gen_id(), "name": "Sentiment Analysis", "agent_slug": "data_analyst", "status": "completed", "order": 2, "depends_on": []},
+        {"id": gen_id(), "name": "Report Writing", "agent_slug": "writer", "status": "completed", "order": 3, "depends_on": []},
+        {"id": gen_id(), "name": "Review All Outputs", "agent_slug": "reviewer", "status": "completed", "order": 4, "depends_on": []},
+        {"id": gen_id(), "name": "Compliance Check", "agent_slug": "compliance", "status": "running", "order": 5, "depends_on": []},
+        {"id": gen_id(), "name": "Final Synthesis", "agent_slug": "synthesis", "status": "pending", "order": 6, "depends_on": []},
     ]
 
+    feedback_task = {
+        "_id": feedback_task_id,
+        "name": "Customer Feedback Analysis",
+        "description": "Analyze Q3 customer feedback across all channels to identify satisfaction trends.",
+        "goal": "Identify top issues, satisfaction drivers, and actionable improvements.",
+        "priority": "medium",
+        "status": "WAITING_FOR_APPROVAL",
+        "governance_mode": "standard",
+        "human_oversight": "approval_for_sensitive",
+        "owner_id": operator["_id"],
+        "owner_name": operator["full_name"],
+        "current_step": "Awaiting Human Approval",
+        "current_agent": "compliance",
+        "version": 1,
+        "subtasks": feedback_subtasks,
+        "started_at": now - timedelta(minutes=45),
+        "created_at": now - timedelta(hours=1),
+        "updated_at": now - timedelta(minutes=5),
+    }
+
+    financial_task_id = gen_id()
     financial_subtasks = [
-        Subtask(id=gen_id(), task_id=financial_task.id, name="Create Execution Plan", agent_slug="planner", status=ExecutionStatus.completed, order=0),
-        Subtask(id=gen_id(), task_id=financial_task.id, name="Financial Data Research", agent_slug="research", status=ExecutionStatus.completed, order=1),
-        Subtask(id=gen_id(), task_id=financial_task.id, name="Financial Analysis", agent_slug="finance", status=ExecutionStatus.running, order=2),
-        Subtask(id=gen_id(), task_id=financial_task.id, name="Compliance Check", agent_slug="compliance", status=ExecutionStatus.pending, order=3),
-        Subtask(id=gen_id(), task_id=financial_task.id, name="Final Synthesis", agent_slug="synthesis", status=ExecutionStatus.pending, order=4),
+        {"id": gen_id(), "name": "Create Execution Plan", "agent_slug": "planner", "status": "completed", "order": 0, "depends_on": []},
+        {"id": gen_id(), "name": "Financial Data Research", "agent_slug": "research", "status": "completed", "order": 1, "depends_on": []},
+        {"id": gen_id(), "name": "Financial Analysis", "agent_slug": "finance", "status": "running", "order": 2, "depends_on": []},
+        {"id": gen_id(), "name": "Compliance Check", "agent_slug": "compliance", "status": "pending", "order": 3, "depends_on": []},
+        {"id": gen_id(), "name": "Final Synthesis", "agent_slug": "synthesis", "status": "pending", "order": 4, "depends_on": []},
     ]
 
-    for st in vendor_subtasks + feedback_subtasks + financial_subtasks:
-        db.add(st)
-    await db.flush()
+    financial_task = {
+        "_id": financial_task_id,
+        "name": "Quarterly Financial Review",
+        "description": "Prepare Q3 financial performance review with variance analysis and Q4 forecast.",
+        "goal": "Deliver executive financial summary with key metrics and forward-looking guidance.",
+        "priority": "critical",
+        "status": "PAUSED",
+        "governance_mode": "strict",
+        "human_oversight": "approval_at_every_stage",
+        "owner_id": manager["_id"],
+        "owner_name": manager["full_name"],
+        "current_step": "Paused",
+        "current_agent": None,
+        "version": 1,
+        "subtasks": financial_subtasks,
+        "started_at": now - timedelta(hours=2),
+        "created_at": now - timedelta(hours=2, minutes=30),
+        "updated_at": now - timedelta(minutes=30),
+    }
 
-    feedback_approval = Approval(
-        id=gen_id(),
-        task_id=feedback_task.id,
-        agent_slug="compliance",
-        requested_action="Proceed with publishing customer feedback analysis report to stakeholder portal",
-        reason="External publication of customer data analysis requires human authorization per data governance policy.",
-        risk_level="high",
-        agent_output={
+    await db.tasks.insert_many([vendor_task, feedback_task, financial_task])
+
+    # Seed Approvals
+    feedback_approval = {
+        "_id": gen_id(),
+        "task_id": feedback_task_id,
+        "task_name": feedback_task["name"],
+        "agent_slug": "compliance",
+        "requested_action": "Proceed with publishing customer feedback analysis report to stakeholder portal",
+        "reason": "External publication of customer data analysis requires human authorization per data governance policy.",
+        "risk_level": "high",
+        "agent_output": {
             "compliance_status": "requires_approval",
             "summary": "Report contains aggregated customer data. External publication requires authorization.",
             "warnings": ["Customer data aggregation requires privacy review", "External portal access requires authorization"],
             "policy_triggered": "Data Export Policy",
         },
-        policy_triggered="Data Export Policy",
-        status=ApprovalStatus.pending,
-        created_at=now - timedelta(minutes=5),
-    )
-    db.add(feedback_approval)
+        "policy_triggered": "Data Export Policy",
+        "status": "pending",
+        "reviewer_id": None,
+        "reviewer_name": None,
+        "reviewer_notes": None,
+        "created_at": now - timedelta(minutes=5),
+        "resolved_at": None,
+    }
+    await db.approvals.insert_one(feedback_approval)
 
+    # Seed Audit Logs
     audit_entries = [
-        AuditLog(id=gen_id(), task_id=vendor_task.id, user_name="Sarah Mitchell", event_type="task_created", action="Task 'Vendor Risk Assessment' created", risk_level="low", created_at=now - timedelta(hours=4)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, agent_slug="planner", event_type="agent_started", action="Planner Agent started", risk_level="low", created_at=now - timedelta(hours=3, minutes=58)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, agent_slug="planner", event_type="agent_completed", action="Planner Agent completed - created 5 subtasks", risk_level="low", created_at=now - timedelta(hours=3, minutes=55)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, agent_slug="research", event_type="agent_completed", action="Research Agent completed - 8 findings identified", risk_level="low", created_at=now - timedelta(hours=3, minutes=30)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, agent_slug="compliance", event_type="governance_triggered", action="Compliance Agent triggered External Communication Policy", risk_level="high", created_at=now - timedelta(hours=2, minutes=30)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, event_type="approval_requested", action="Approval requested for external report publication", risk_level="high", created_at=now - timedelta(hours=2, minutes=28)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, user_name="Sarah Mitchell", event_type="approval_granted", action="Manager approved external publication", risk_level="medium", created_at=now - timedelta(hours=2)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, agent_slug="synthesis", event_type="agent_completed", action="Final Synthesis Agent completed", risk_level="low", created_at=now - timedelta(hours=1, minutes=10)),
-        AuditLog(id=gen_id(), task_id=vendor_task.id, event_type="task_completed", action="Task completed successfully", risk_level="low", created_at=now - timedelta(hours=1)),
-        AuditLog(id=gen_id(), task_id=feedback_task.id, user_name="James Park", event_type="task_created", action="Task 'Customer Feedback Analysis' created", risk_level="low", created_at=now - timedelta(hours=1)),
-        AuditLog(id=gen_id(), task_id=feedback_task.id, agent_slug="research", event_type="agent_completed", action="Research Agent completed feedback analysis", risk_level="low", created_at=now - timedelta(minutes=40)),
-        AuditLog(id=gen_id(), task_id=feedback_task.id, agent_slug="compliance", event_type="governance_triggered", action="Compliance Agent triggered Data Export Policy", risk_level="high", created_at=now - timedelta(minutes=6)),
-        AuditLog(id=gen_id(), task_id=feedback_task.id, event_type="approval_requested", action="Approval required for external data publication", risk_level="high", created_at=now - timedelta(minutes=5)),
-        AuditLog(id=gen_id(), task_id=financial_task.id, user_name="Sarah Mitchell", event_type="task_created", action="Task 'Quarterly Financial Review' created", risk_level="low", created_at=now - timedelta(hours=2, minutes=30)),
-        AuditLog(id=gen_id(), task_id=financial_task.id, agent_slug="finance", event_type="agent_started", action="Finance Agent started financial analysis", risk_level="low", created_at=now - timedelta(hours=1, minutes=30)),
-        AuditLog(id=gen_id(), task_id=financial_task.id, user_name="Sarah Mitchell", event_type="task_paused", action="Task paused by manager", risk_level="low", created_at=now - timedelta(minutes=30)),
+        {"_id": gen_id(), "task_id": vendor_task_id, "user_name": "Sarah Mitchell", "event_type": "task_created", "action": "Task 'Vendor Risk Assessment' created", "risk_level": "low", "created_at": now - timedelta(hours=4)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "agent_slug": "planner", "event_type": "agent_started", "action": "Planner Agent started", "risk_level": "low", "created_at": now - timedelta(hours=3, minutes=58)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "agent_slug": "planner", "event_type": "agent_completed", "action": "Planner Agent completed - created 5 subtasks", "risk_level": "low", "created_at": now - timedelta(hours=3, minutes=55)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "agent_slug": "research", "event_type": "agent_completed", "action": "Research Agent completed - 8 findings identified", "risk_level": "low", "created_at": now - timedelta(hours=3, minutes=30)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "agent_slug": "compliance", "event_type": "governance_triggered", "action": "Compliance Agent triggered External Communication Policy", "risk_level": "high", "created_at": now - timedelta(hours=2, minutes=30)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "event_type": "approval_requested", "action": "Approval requested for external report publication", "risk_level": "high", "created_at": now - timedelta(hours=2, minutes=28)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "user_name": "Sarah Mitchell", "event_type": "approval_granted", "action": "Manager approved external publication", "risk_level": "medium", "created_at": now - timedelta(hours=2)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "agent_slug": "synthesis", "event_type": "agent_completed", "action": "Final Synthesis Agent completed", "risk_level": "low", "created_at": now - timedelta(hours=1, minutes=10)},
+        {"_id": gen_id(), "task_id": vendor_task_id, "event_type": "task_completed", "action": "Task completed successfully", "risk_level": "low", "created_at": now - timedelta(hours=1)},
+        {"_id": gen_id(), "task_id": feedback_task_id, "user_name": "James Park", "event_type": "task_created", "action": "Task 'Customer Feedback Analysis' created", "risk_level": "low", "created_at": now - timedelta(hours=1)},
+        {"_id": gen_id(), "task_id": feedback_task_id, "agent_slug": "research", "event_type": "agent_completed", "action": "Research Agent completed feedback analysis", "risk_level": "low", "created_at": now - timedelta(minutes=40)},
+        {"_id": gen_id(), "task_id": feedback_task_id, "agent_slug": "compliance", "event_type": "governance_triggered", "action": "Compliance Agent triggered Data Export Policy", "risk_level": "high", "created_at": now - timedelta(minutes=6)},
+        {"_id": gen_id(), "task_id": feedback_task_id, "event_type": "approval_requested", "action": "Approval required for external data publication", "risk_level": "high", "created_at": now - timedelta(minutes=5)},
+        {"_id": gen_id(), "task_id": financial_task_id, "user_name": "Sarah Mitchell", "event_type": "task_created", "action": "Task 'Quarterly Financial Review' created", "risk_level": "low", "created_at": now - timedelta(hours=2, minutes=30)},
+        {"_id": gen_id(), "task_id": financial_task_id, "agent_slug": "finance", "event_type": "agent_started", "action": "Finance Agent started financial analysis", "risk_level": "low", "created_at": now - timedelta(hours=1, minutes=30)},
+        {"_id": gen_id(), "task_id": financial_task_id, "user_name": "Sarah Mitchell", "event_type": "task_paused", "action": "Task paused by manager", "risk_level": "low", "created_at": now - timedelta(minutes=30)},
     ]
-    for entry in audit_entries:
-        db.add(entry)
+    await db.audit_logs.insert_many(audit_entries)
 
+    # Seed Governance Events
     gov_events = [
-        GovernanceEvent(
-            id=gen_id(),
-            policy_id=policies["External Communication Policy"].id,
-            task_id=vendor_task.id,
-            agent_slug="compliance",
-            event_type="policy_triggered",
-            description="External Communication Policy triggered during vendor report publication",
-            action_taken="require_approval",
-            resolved=True,
-            created_at=now - timedelta(hours=2, minutes=30),
-        ),
-        GovernanceEvent(
-            id=gen_id(),
-            policy_id=policies["Data Export Policy"].id,
-            task_id=feedback_task.id,
-            agent_slug="compliance",
-            event_type="policy_triggered",
-            description="Data Export Policy triggered for customer feedback report",
-            action_taken="require_approval",
-            resolved=False,
-            created_at=now - timedelta(minutes=6),
-        ),
+        {
+            "_id": gen_id(),
+            "policy_id": policy_map["External Communication Policy"]["_id"],
+            "policy_name": "External Communication Policy",
+            "task_id": vendor_task_id,
+            "agent_slug": "compliance",
+            "event_type": "policy_triggered",
+            "description": "External Communication Policy triggered during vendor report publication",
+            "action_taken": "require_approval",
+            "resolved": True,
+            "created_at": now - timedelta(hours=2, minutes=30),
+        },
+        {
+            "_id": gen_id(),
+            "policy_id": policy_map["Data Export Policy"]["_id"],
+            "policy_name": "Data Export Policy",
+            "task_id": feedback_task_id,
+            "agent_slug": "compliance",
+            "event_type": "policy_triggered",
+            "description": "Data Export Policy triggered for customer feedback report",
+            "action_taken": "require_approval",
+            "resolved": False,
+            "created_at": now - timedelta(minutes=6),
+        },
     ]
-    for ge in gov_events:
-        db.add(ge)
+    await db.governance_events.insert_many(gov_events)
 
+    # Seed Notifications
     notifs = [
-        Notification(
-            id=gen_id(),
-            user_id=manager.id,
-            title="Approval Required",
-            message="Customer Feedback Analysis requires your approval for external publication.",
-            type="warning",
-            link=f"/approvals/{feedback_approval.id}",
-            is_read=False,
-            created_at=now - timedelta(minutes=5),
-        ),
-        Notification(
-            id=gen_id(),
-            user_id=manager.id,
-            title="Task Completed",
-            message="Vendor Risk Assessment has been completed successfully.",
-            type="success",
-            link=f"/tasks/{vendor_task.id}",
-            is_read=True,
-            created_at=now - timedelta(hours=1),
-        ),
+        {
+            "_id": gen_id(),
+            "user_id": manager["_id"],
+            "title": "Approval Required",
+            "message": "Customer Feedback Analysis requires your approval for external publication.",
+            "type": "warning",
+            "link": f"/approvals/{feedback_approval['_id']}",
+            "is_read": False,
+            "created_at": now - timedelta(minutes=5),
+        },
+        {
+            "_id": gen_id(),
+            "user_id": manager["_id"],
+            "title": "Task Completed",
+            "message": "Vendor Risk Assessment has been completed successfully.",
+            "type": "success",
+            "link": f"/tasks/{vendor_task_id}",
+            "is_read": True,
+            "created_at": now - timedelta(hours=1),
+        },
     ]
-    for n in notifs:
-        db.add(n)
-
-    await db.commit()
-    print("[OK] Database seeded with demo data")
+    await db.notifications.insert_many(notifs)
+    print("[OK] MongoDB Atlas seeded with initial enterprise data")

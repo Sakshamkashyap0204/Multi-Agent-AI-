@@ -1,14 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-from models.database import get_db
-from models.db_models import Approval, ApprovalStatus, Task, TaskStatus
+from models.database import get_db, serialize_doc, MongoModel
 from api.auth import get_current_active_user
-from models.db_models import User
 from services.audit import log_event
 from services.websocket_manager import manager
 
@@ -19,134 +14,112 @@ class ApprovalAction(BaseModel):
     notes: Optional[str] = None
 
 
-def approval_to_dict(a: Approval) -> dict:
-    return {
-        "id": a.id,
-        "task_id": a.task_id,
-        "task_name": a.task.name if a.task else None,
-        "agent_slug": a.agent_slug,
-        "requested_action": a.requested_action,
-        "reason": a.reason,
-        "risk_level": a.risk_level,
-        "agent_output": a.agent_output,
-        "policy_triggered": a.policy_triggered,
-        "status": a.status.value,
-        "reviewer_id": a.reviewer_id,
-        "reviewer_name": a.reviewer.full_name if a.reviewer else None,
-        "reviewer_notes": a.reviewer_notes,
-        "created_at": a.created_at.isoformat() if a.created_at else None,
-        "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
-    }
-
-
 @router.get("")
 async def list_approvals(
     status: Optional[str] = None,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    query = select(Approval).options(selectinload(Approval.task), selectinload(Approval.reviewer))
+    query = {}
     if status:
-        query = query.where(Approval.status == ApprovalStatus(status))
-    query = query.order_by(Approval.created_at.desc())
-    result = await db.execute(query)
-    approvals = result.scalars().all()
-    return [approval_to_dict(a) for a in approvals]
+        query["status"] = status
+    cursor = db.approvals.find(query).sort("created_at", -1)
+    approvals = await cursor.to_list(100)
+    return [serialize_doc(a) for a in approvals]
 
 
 @router.get("/{approval_id}")
 async def get_approval(
     approval_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(
-        select(Approval)
-        .options(selectinload(Approval.task), selectinload(Approval.reviewer))
-        .where(Approval.id == approval_id)
-    )
-    approval = result.scalar_one_or_none()
+    approval = await db.approvals.find_one({"_id": approval_id})
     if not approval:
         raise HTTPException(status_code=404, detail="Approval not found")
-    return approval_to_dict(approval)
+    return serialize_doc(approval)
 
 
 async def _resolve_approval(
     approval_id: str,
-    new_status: ApprovalStatus,
+    new_status: str,
     notes: str,
-    current_user: User,
-    db: AsyncSession
+    current_user: MongoModel,
+    db
 ):
-    result = await db.execute(
-        select(Approval)
-        .options(selectinload(Approval.task))
-        .where(Approval.id == approval_id)
-    )
-    approval = result.scalar_one_or_none()
+    approval = await db.approvals.find_one({"_id": approval_id})
     if not approval:
         raise HTTPException(status_code=404, detail="Approval not found")
-    if approval.status != ApprovalStatus.pending:
+    if approval.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Approval already resolved")
 
-    approval.status = new_status
-    approval.reviewer_id = current_user.id
-    approval.reviewer_notes = notes
-    approval.resolved_at = datetime.utcnow()
-    await db.commit()
+    now = datetime.utcnow()
+    await db.approvals.update_one(
+        {"_id": approval_id},
+        {"$set": {
+            "status": new_status,
+            "reviewer_id": current_user.id,
+            "reviewer_name": current_user.get("full_name", "Authorized Executive"),
+            "reviewer_notes": notes,
+            "resolved_at": now,
+        }}
+    )
 
     event_map = {
-        ApprovalStatus.approved: ("approval_granted", "Approval granted", "low"),
-        ApprovalStatus.rejected: ("approval_rejected", "Approval rejected", "medium"),
-        ApprovalStatus.changes_requested: ("changes_requested", "Changes requested", "medium"),
+        "approved": ("approval_granted", "Approval granted", "low"),
+        "rejected": ("approval_rejected", "Approval rejected", "medium"),
+        "changes_requested": ("changes_requested", "Changes requested", "medium"),
     }
     event_type, action, risk = event_map.get(new_status, ("approval_resolved", "Approval resolved", "low"))
 
     await log_event(
         db, event_type, action,
-        task_id=approval.task_id,
+        task_id=approval.get("task_id"),
         user_id=current_user.id,
-        user_name=current_user.full_name,
-        agent_slug=approval.agent_slug,
+        user_name=current_user.get("full_name"),
+        agent_slug=approval.get("agent_slug"),
         risk_level=risk,
         details={"approval_id": approval_id, "notes": notes}
     )
 
-    await manager.broadcast(f"task:{approval.task_id}", {
-        "type": "approval_resolved",
-        "approval_id": approval_id,
-        "status": new_status.value,
-        "reviewer": current_user.full_name,
-    })
+    task_id = approval.get("task_id")
+    if task_id:
+        await manager.broadcast(f"task:{task_id}", {
+            "type": "approval_resolved",
+            "approval_id": approval_id,
+            "status": new_status,
+            "reviewer": current_user.get("full_name"),
+        })
 
-    return approval_to_dict(approval)
+    updated = await db.approvals.find_one({"_id": approval_id})
+    return serialize_doc(updated)
 
 
 @router.post("/{approval_id}/approve")
 async def approve(
     approval_id: str,
     body: ApprovalAction = ApprovalAction(),
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    return await _resolve_approval(approval_id, ApprovalStatus.approved, body.notes or "", current_user, db)
+    return await _resolve_approval(approval_id, "approved", body.notes or "", current_user, db)
 
 
 @router.post("/{approval_id}/reject")
 async def reject(
     approval_id: str,
     body: ApprovalAction = ApprovalAction(),
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    return await _resolve_approval(approval_id, ApprovalStatus.rejected, body.notes or "", current_user, db)
+    return await _resolve_approval(approval_id, "rejected", body.notes or "", current_user, db)
 
 
 @router.post("/{approval_id}/request-changes")
 async def request_changes(
     approval_id: str,
     body: ApprovalAction = ApprovalAction(),
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    return await _resolve_approval(approval_id, ApprovalStatus.changes_requested, body.notes or "", current_user, db)
+    return await _resolve_approval(approval_id, "changes_requested", body.notes or "", current_user, db)

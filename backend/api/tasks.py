@@ -1,13 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-from models.database import get_db
-from models.db_models import Task, Subtask, AgentExecution, Agent, TaskStatus, TaskPriority, AuditLog, TaskVersion
+from models.database import get_db, serialize_doc, gen_id, MongoModel
 from api.auth import get_current_active_user
-from models.db_models import User
 from services.audit import log_event
 from services.orchestration import orchestrate_task
 
@@ -24,54 +20,21 @@ class TaskCreate(BaseModel):
     deadline: Optional[str] = None
 
 
-def task_to_dict(task: Task, include_subtasks: bool = False) -> dict:
-    d = {
-        "id": task.id,
-        "name": task.name,
-        "description": task.description,
-        "goal": task.goal,
-        "priority": task.priority.value if task.priority else "medium",
-        "status": task.status.value if task.status else "CREATED",
-        "governance_mode": task.governance_mode,
-        "human_oversight": task.human_oversight,
-        "current_step": task.current_step,
-        "current_agent": task.current_agent,
-        "execution_plan": task.execution_plan,
-        "final_output": task.final_output,
-        "version": task.version,
-        "owner_id": task.owner_id,
-        "owner_name": task.owner.full_name if task.owner else None,
-        "started_at": task.started_at.isoformat() if task.started_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-        "deadline": task.deadline.isoformat() if task.deadline else None,
-    }
-    if include_subtasks and task.subtasks:
-        d["subtasks"] = [subtask_to_dict(s) for s in sorted(task.subtasks, key=lambda x: x.order)]
+def task_to_dict(task: dict, include_subtasks: bool = True) -> dict:
+    if not task:
+        return {}
+    d = serialize_doc(task)
+    if not include_subtasks and "subtasks" in d:
+        d.pop("subtasks", None)
     return d
-
-
-def subtask_to_dict(s: Subtask) -> dict:
-    return {
-        "id": s.id,
-        "name": s.name,
-        "description": s.description,
-        "agent_slug": s.agent_slug,
-        "status": s.status.value if s.status else "pending",
-        "order": s.order,
-        "depends_on": s.depends_on or [],
-        "output": s.output,
-        "created_at": s.created_at.isoformat() if s.created_at else None,
-    }
 
 
 @router.post("")
 async def create_task(
     body: TaskCreate,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
     deadline = None
     if body.deadline:
@@ -80,32 +43,39 @@ async def create_task(
         except Exception:
             pass
 
-    task = Task(
-        name=body.name,
-        description=body.description,
-        goal=body.goal,
-        priority=TaskPriority(body.priority),
-        governance_mode=body.governance_mode,
-        human_oversight=body.human_oversight,
-        deadline=deadline,
-        owner_id=current_user.id,
-        status=TaskStatus.created,
-    )
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
+    task_doc = {
+        "_id": gen_id(),
+        "name": body.name,
+        "description": body.description or "",
+        "goal": body.goal or "",
+        "priority": body.priority,
+        "governance_mode": body.governance_mode,
+        "human_oversight": body.human_oversight,
+        "deadline": deadline,
+        "owner_id": current_user.id,
+        "owner_name": current_user.get("full_name", "System Operator"),
+        "status": "CREATED",
+        "current_step": "Initializing",
+        "current_agent": None,
+        "execution_plan": None,
+        "final_output": None,
+        "version": 1,
+        "subtasks": [],
+        "started_at": None,
+        "completed_at": None,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    await db.tasks.insert_one(task_doc)
 
     await log_event(
-        db, "task_created", f"Task '{task.name}' created",
-        task_id=task.id, user_id=current_user.id, user_name=current_user.full_name,
+        db, "task_created", f"Task '{task_doc['name']}' created",
+        task_id=task_doc["_id"], user_id=current_user.id, user_name=current_user.get("full_name"),
         risk_level="low", details={"priority": body.priority}
     )
 
-    background_tasks.add_task(orchestrate_task, task.id)
-
-    result = await db.execute(select(Task).where(Task.id == task.id))
-    t = result.scalar_one()
-    return task_to_dict(t)
+    background_tasks.add_task(orchestrate_task, task_doc["_id"])
+    return task_to_dict(task_doc)
 
 
 @router.get("")
@@ -115,64 +85,47 @@ async def list_tasks(
     search: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    from sqlalchemy.orm import selectinload
-    query = select(Task).options(selectinload(Task.owner))
-
-    if current_user.role.value == "operator":
-        query = query.where(Task.owner_id == current_user.id)
+    query = {}
+    if current_user.get("role") == "operator":
+        query["owner_id"] = current_user.id
 
     if status:
-        query = query.where(Task.status == TaskStatus(status))
+        query["status"] = status
     if priority:
-        query = query.where(Task.priority == TaskPriority(priority))
+        query["priority"] = priority
     if search:
-        query = query.where(Task.name.ilike(f"%{search}%"))
+        query["name"] = {"$regex": search, "$options": "i"}
 
-    query = query.order_by(Task.created_at.desc()).offset(skip).limit(limit)
-    result = await db.execute(query)
-    tasks = result.scalars().all()
+    cursor = db.tasks.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    tasks = await cursor.to_list(limit)
     return [task_to_dict(t) for t in tasks]
 
 
 @router.get("/stats")
 async def get_stats(
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    from sqlalchemy import case
-    result = await db.execute(
-        select(
-            func.count(Task.id).label("total"),
-            func.sum(case((Task.status == TaskStatus.running, 1), else_=0)).label("running"),
-            func.sum(case((Task.status == TaskStatus.completed, 1), else_=0)).label("completed"),
-            func.sum(case((Task.status == TaskStatus.failed, 1), else_=0)).label("failed"),
-            func.sum(case((Task.status == TaskStatus.waiting_for_approval, 1), else_=0)).label("waiting"),
-            func.sum(case((Task.status == TaskStatus.paused, 1), else_=0)).label("paused"),
-        )
-    )
-    row = result.one()
+    total = await db.tasks.count_documents({})
+    running = await db.tasks.count_documents({"status": "RUNNING"})
+    completed = await db.tasks.count_documents({"status": "COMPLETED"})
+    failed = await db.tasks.count_documents({"status": "FAILED"})
+    waiting = await db.tasks.count_documents({"status": "WAITING_FOR_APPROVAL"})
+    paused = await db.tasks.count_documents({"status": "PAUSED"})
 
-    agent_result = await db.execute(
-        select(func.count(Agent.id)).where(Agent.status == "active")
-    )
-    active_agents = agent_result.scalar() or 0
-
-    from models.db_models import Approval, ApprovalStatus
-    approval_result = await db.execute(
-        select(func.count(Approval.id)).where(Approval.status == ApprovalStatus.pending)
-    )
-    pending_approvals = approval_result.scalar() or 0
+    active_agents = await db.agents.count_documents({"status": "active"})
+    pending_approvals = await db.approvals.count_documents({"status": "pending"})
 
     return {
-        "total_tasks": row.total or 0,
-        "active_tasks": (row.running or 0) + (row.waiting or 0) + (row.paused or 0),
-        "running_tasks": row.running or 0,
-        "completed_tasks": row.completed or 0,
-        "failed_tasks": row.failed or 0,
-        "waiting_tasks": row.waiting or 0,
+        "total_tasks": total,
+        "active_tasks": running + waiting + paused,
+        "running_tasks": running,
+        "completed_tasks": completed,
+        "failed_tasks": failed,
+        "waiting_tasks": waiting,
         "active_agents": active_agents,
         "pending_approvals": pending_approvals,
     }
@@ -181,16 +134,10 @@ async def get_stats(
 @router.get("/{task_id}")
 async def get_task(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    from sqlalchemy.orm import selectinload
-    result = await db.execute(
-        select(Task)
-        .options(selectinload(Task.owner), selectinload(Task.subtasks))
-        .where(Task.id == task_id)
-    )
-    task = result.scalar_one_or_none()
+    task = await db.tasks.find_one({"_id": task_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task_to_dict(task, include_subtasks=True)
@@ -199,101 +146,47 @@ async def get_task(
 @router.get("/{task_id}/executions")
 async def get_executions(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    from sqlalchemy.orm import selectinload
-    result = await db.execute(
-        select(AgentExecution)
-        .options(selectinload(AgentExecution.agent))
-        .where(AgentExecution.task_id == task_id)
-        .order_by(AgentExecution.created_at)
-    )
-    execs = result.scalars().all()
-    return [
-        {
-            "id": e.id,
-            "agent_id": e.agent_id,
-            "agent_name": e.agent.name if e.agent else e.agent_id,
-            "agent_slug": e.agent.slug if e.agent else None,
-            "subtask_id": e.subtask_id,
-            "status": e.status.value,
-            "input_data": e.input_data,
-            "output_data": e.output_data,
-            "error": e.error,
-            "iterations": e.iterations,
-            "started_at": e.started_at.isoformat() if e.started_at else None,
-            "completed_at": e.completed_at.isoformat() if e.completed_at else None,
-            "duration": (e.completed_at - e.started_at).total_seconds() if e.completed_at and e.started_at else None,
-        }
-        for e in execs
-    ]
+    cursor = db.agent_executions.find({"task_id": task_id}).sort("started_at", 1)
+    execs = await cursor.to_list(100)
+    return [serialize_doc(e) for e in execs]
 
 
 @router.get("/{task_id}/audit")
 async def get_task_audit(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(
-        select(AuditLog)
-        .where(AuditLog.task_id == task_id)
-        .order_by(AuditLog.created_at)
-    )
-    logs = result.scalars().all()
-    return [
-        {
-            "id": l.id,
-            "event_type": l.event_type,
-            "action": l.action,
-            "agent_slug": l.agent_slug,
-            "user_name": l.user_name,
-            "result": l.result,
-            "risk_level": l.risk_level,
-            "details": l.details,
-            "created_at": l.created_at.isoformat(),
-        }
-        for l in logs
-    ]
+    cursor = db.audit_logs.find({"task_id": task_id}).sort("created_at", 1)
+    logs = await cursor.to_list(100)
+    return [serialize_doc(l) for l in logs]
 
 
 @router.get("/{task_id}/versions")
 async def get_versions(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(
-        select(TaskVersion).where(TaskVersion.task_id == task_id).order_by(TaskVersion.version)
-    )
-    versions = result.scalars().all()
-    return [
-        {
-            "id": v.id,
-            "version": v.version,
-            "final_output": v.final_output,
-            "revision_notes": v.revision_notes,
-            "created_at": v.created_at.isoformat(),
-        }
-        for v in versions
-    ]
+    cursor = db.task_versions.find({"task_id": task_id}).sort("version", 1)
+    versions = await cursor.to_list(20)
+    return [serialize_doc(v) for v in versions]
 
 
 @router.post("/{task_id}/pause")
 async def pause_task(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = await db.tasks.find_one({"_id": task_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    task.status = TaskStatus.paused
-    task.updated_at = datetime.utcnow()
-    await db.commit()
-    await log_event(db, "task_paused", "Task paused", task_id=task_id, user_id=current_user.id, user_name=current_user.full_name)
+    await db.tasks.update_one({"_id": task_id}, {"$set": {"status": "PAUSED", "updated_at": datetime.utcnow()}})
+    await log_event(db, "task_paused", "Task paused", task_id=task_id, user_id=current_user.id, user_name=current_user.get("full_name"))
     return {"status": "paused"}
 
 
@@ -301,34 +194,28 @@ async def pause_task(
 async def resume_task(
     task_id: str,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = await db.tasks.find_one({"_id": task_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    task.status = TaskStatus.running
-    task.updated_at = datetime.utcnow()
-    await db.commit()
-    await log_event(db, "task_resumed", "Task resumed", task_id=task_id, user_id=current_user.id, user_name=current_user.full_name)
+    await db.tasks.update_one({"_id": task_id}, {"$set": {"status": "RUNNING", "updated_at": datetime.utcnow()}})
+    await log_event(db, "task_resumed", "Task resumed", task_id=task_id, user_id=current_user.id, user_name=current_user.get("full_name"))
     return {"status": "running"}
 
 
 @router.post("/{task_id}/cancel")
 async def cancel_task(
     task_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = await db.tasks.find_one({"_id": task_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    task.status = TaskStatus.cancelled
-    task.updated_at = datetime.utcnow()
-    await db.commit()
-    await log_event(db, "task_cancelled", "Task cancelled", task_id=task_id, user_id=current_user.id, user_name=current_user.full_name)
+    await db.tasks.update_one({"_id": task_id}, {"$set": {"status": "CANCELLED", "updated_at": datetime.utcnow()}})
+    await log_event(db, "task_cancelled", "Task cancelled", task_id=task_id, user_id=current_user.id, user_name=current_user.get("full_name"))
     return {"status": "cancelled"}
 
 
@@ -337,34 +224,40 @@ async def request_revision(
     task_id: str,
     body: dict,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: MongoModel = Depends(get_current_active_user),
+    db = Depends(get_db)
 ):
-    result = await db.execute(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = await db.tasks.find_one({"_id": task_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task.version = (task.version or 1) + 1
-    task.status = TaskStatus.created
-    task.current_step = None
-    task.current_agent = None
-    task.updated_at = datetime.utcnow()
+    new_version = (task.get("version") or 1) + 1
+    version_doc = {
+        "_id": gen_id(),
+        "task_id": task_id,
+        "version": new_version - 1,
+        "final_output": task.get("final_output"),
+        "revision_notes": body.get("notes", ""),
+        "created_at": datetime.utcnow(),
+    }
+    await db.task_versions.insert_one(version_doc)
 
-    version = TaskVersion(
-        task_id=task.id,
-        version=task.version - 1,
-        final_output=task.final_output,
-        revision_notes=body.get("notes", ""),
+    await db.tasks.update_one(
+        {"_id": task_id},
+        {"$set": {
+            "version": new_version,
+            "status": "CREATED",
+            "current_step": "Planning Revision",
+            "current_agent": None,
+            "updated_at": datetime.utcnow(),
+        }}
     )
-    db.add(version)
-    await db.commit()
 
     await log_event(
         db, "revision_requested", f"Revision requested: {body.get('notes', '')}",
-        task_id=task_id, user_id=current_user.id, user_name=current_user.full_name,
+        task_id=task_id, user_id=current_user.id, user_name=current_user.get("full_name"),
         risk_level="low"
     )
 
-    background_tasks.add_task(orchestrate_task, task.id)
-    return {"status": "revision_started", "version": task.version}
+    background_tasks.add_task(orchestrate_task, task_id)
+    return {"status": "revision_started", "version": new_version}
