@@ -13,8 +13,14 @@ class WebSocketClient {
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/${room}`;
+    let wsUrl;
+    if (import.meta.env?.VITE_WS_URL) {
+      const baseWs = import.meta.env.VITE_WS_URL.replace(/\/$/, '');
+      wsUrl = `${baseWs}/ws/${room}`;
+    } else {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsUrl = `${protocol}//${window.location.host}/ws/${room}`;
+    }
 
     try {
       this.socket = new WebSocket(wsUrl);

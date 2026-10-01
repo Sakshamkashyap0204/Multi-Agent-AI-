@@ -1,4 +1,7 @@
-const API_BASE = '/api';
+const envApi = import.meta.env?.VITE_API_URL || '';
+const API_BASE = envApi
+  ? (envApi.endsWith('/api') ? envApi : `${envApi.replace(/\/$/, '')}/api`)
+  : '/api';
 
 class ApiClient {
   constructor() {
