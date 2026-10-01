@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#f8fafc] text-slate-800 font-sans text-sm selection:bg-brand-500 selection:text-white;
+  }
+
+  /* Custom subtle scrollbars for enterprise feel */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-300 rounded-full hover:bg-slate-400;
+  }
+}
+
+.table-header {
+  @apply text-xs font-semibold uppercase tracking-wider text-slate-500 bg-slate-50 border-b border-slate-200;
+}
+
+.card-enterprise {
+  @apply bg-white border border-slate-200/80 rounded-lg shadow-sm;
+}
